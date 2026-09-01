@@ -15,8 +15,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.data_generator import generate_credit_data
-from src.model_trainer import ALL_FEATURES, train_all_models
-from src.shap_utils import compute_shap_values, single_prediction_shap
+from src.model_trainer import ALL_FEATURES, CATEGORICAL_FEATURES, train_all_models
+from src.shap_utils import ExplainabilityBackend, compute_global_importance, compute_local_importance
 
 st.set_page_config(
     page_title="Credit Risk Explainable AI",
@@ -57,7 +57,7 @@ st.sidebar.markdown("---")
 st.sidebar.markdown(
     "**Dataset:** 5,000 synthetic loan applicants\n\n"
     "**Target:** Probability of default\n\n"
-    "[View source on GitHub](https://github.com/YOUR_USERNAME/credit-risk-explainable-ai)"
+    "[View source on GitHub](https://github.com/Chandrika1908/Credit-Risk-Explainable-AI-Dashboard)"
 )
 
 active_model = models[selected_model_name]
@@ -163,36 +163,54 @@ with tab_explain:
         "or away from default risk, across a sample of the test set."
     )
 
-    with st.spinner("Computing SHAP values..."):
-        _, shap_values, X_transformed, feature_names = compute_shap_values(
+    with st.spinner("Computing feature importance..."):
+        backend, feature_names, values = compute_global_importance(
             active_model.pipeline, active_model.X_test, max_samples=250
         )
 
-    mean_abs_shap = np.abs(shap_values).mean(axis=0)
-    importance_df = pd.DataFrame(
-        {"feature": feature_names, "mean_abs_shap": mean_abs_shap}
-    ).sort_values("mean_abs_shap", ascending=True).tail(15)
+    if backend == ExplainabilityBackend.SHAP:
+        mean_abs = np.abs(values).mean(axis=0)
+        importance_df = pd.DataFrame(
+            {"feature": feature_names, "importance": mean_abs}
+        ).sort_values("importance", ascending=True).tail(15)
 
-    fig = px.bar(
-        importance_df, x="mean_abs_shap", y="feature", orientation="h",
-        title="Top 15 Features by Mean |SHAP value|",
-        labels={"mean_abs_shap": "Mean |SHAP value|", "feature": ""},
-    )
-    fig.update_layout(height=500)
-    st.plotly_chart(fig, use_container_width=True)
+        fig = px.bar(
+            importance_df, x="importance", y="feature", orientation="h",
+            title="Top 15 Features by Mean |SHAP value|",
+            labels={"importance": "Mean |SHAP value|", "feature": ""},
+        )
+        fig.update_layout(height=500)
+        st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("### SHAP summary (distribution of impact)")
-    summary_df = pd.DataFrame(shap_values, columns=feature_names)
-    top_features = importance_df["feature"].tolist()[::-1][:8]
-    melted = summary_df[top_features].melt(var_name="feature", value_name="shap_value")
-    fig2 = px.strip(
-        melted, x="shap_value", y="feature", orientation="h",
-        title="SHAP Value Spread — Top 8 Features",
-        labels={"shap_value": "SHAP value (impact on default risk)"},
-    )
-    fig2.update_traces(marker=dict(opacity=0.5, size=4))
-    fig2.update_layout(height=450)
-    st.plotly_chart(fig2, use_container_width=True)
+        st.markdown("### SHAP summary (distribution of impact)")
+        summary_df = pd.DataFrame(values, columns=feature_names)
+        top_features = importance_df["feature"].tolist()[::-1][:8]
+        melted = summary_df[top_features].melt(var_name="feature", value_name="shap_value")
+        fig2 = px.strip(
+            melted, x="shap_value", y="feature", orientation="h",
+            title="SHAP Value Spread — Top 8 Features",
+            labels={"shap_value": "SHAP value (impact on default risk)"},
+        )
+        fig2.update_traces(marker=dict(opacity=0.5, size=4))
+        fig2.update_layout(height=450)
+        st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.warning(
+            "SHAP's compiled component isn't available in this hosting "
+            "environment, so this falls back to the model's own built-in "
+            "feature importance. The ranking is still meaningful — it's "
+            "just dataset-wide rather than SHAP's signed, per-sample values."
+        )
+        importance_df = pd.DataFrame(
+            {"feature": feature_names, "importance": values}
+        ).sort_values("importance", ascending=True).tail(15)
+        fig = px.bar(
+            importance_df, x="importance", y="feature", orientation="h",
+            title="Top 15 Features by Model-Native Importance",
+            labels={"importance": "Importance", "feature": ""},
+        )
+        fig.update_layout(height=500)
+        st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # TAB 4 — What-If Simulator
@@ -254,18 +272,33 @@ with tab_simulate:
         st.caption(f"Debt-to-income ratio: {debt_to_income:.2f}")
 
     with r2:
-        shap_vals, base_value, feat_names = single_prediction_shap(active_model.pipeline, applicant)
-        contrib_df = pd.DataFrame({"feature": feat_names, "impact": shap_vals}).sort_values(
+        backend, feat_names, impacts = compute_local_importance(
+            active_model.pipeline, applicant, active_model.X_test,
+            ALL_FEATURES, CATEGORICAL_FEATURES,
+        )
+        contrib_df = pd.DataFrame({"feature": feat_names, "impact": impacts}).sort_values(
             "impact", key=abs, ascending=True
         ).tail(10)
+        chart_title = (
+            "What's driving THIS prediction (SHAP)"
+            if backend == ExplainabilityBackend.SHAP
+            else "What's driving THIS prediction (sensitivity analysis)"
+        )
         fig = px.bar(
             contrib_df, x="impact", y="feature", orientation="h",
-            title="What's driving THIS prediction",
+            title=chart_title,
             color="impact", color_continuous_scale=["#3B82F6", "#EF4444"],
             labels={"impact": "Impact on default risk", "feature": ""},
         )
         fig.update_layout(height=380, showlegend=False, coloraxis_showscale=False)
         st.plotly_chart(fig, use_container_width=True)
+        if backend == ExplainabilityBackend.OCCLUSION:
+            st.caption(
+                "SHAP's compiled component isn't available here, so this "
+                "shows a sensitivity analysis instead: each bar is how much "
+                "the risk score changes if that feature were swapped for a "
+                "'typical' applicant's value."
+            )
 
     st.info(
         "💡 Try it: push **credit utilization** near 1.0 and **late payments** "
